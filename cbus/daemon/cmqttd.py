@@ -15,7 +15,7 @@
 # You should have received a copy of the GNU Lesser General Public License
 # along with this library.  If not, see <http://www.gnu.org/licenses/>.
 
-from asyncio import get_event_loop, run
+from asyncio import get_event_loop, run, sleep
 from argparse import ArgumentParser, FileType
 import json
 import logging
@@ -33,6 +33,8 @@ from cbus.common import MIN_GROUP_ADDR, MAX_GROUP_ADDR, check_ga, Application
 from cbus.paho_asyncio import AsyncioHelper
 from cbus.protocol.pciprotocol import PCIProtocol
 from cbus.toolkit.cbz import CBZ
+from cbus.toolkit.periodic import Periodic
+
 
 
 logger = logging.getLogger(__name__)
@@ -126,6 +128,24 @@ class MqttClient(mqtt.Client):
         self.subscribe([(set_topic(ga), 2) for ga in ga_range()])
         self.publish_all_lights(userdata.labels)
 
+    def switchLight(self, userdata, group_addr, light_on, brightness, transition_time ):
+        logger.debug("switching now")
+        # push state to CBus and republish on MQTT
+        # DEBUG: This is where calls to turn the lights end up
+        if light_on:
+            if brightness == 255 and transition_time == 0:
+                # lighting on
+                userdata.lighting_group_on(group_addr)
+                self.lighting_group_on(None, group_addr)
+            else:
+                # ramp
+                userdata.lighting_group_ramp(group_addr, transition_time, brightness)
+                self.lighting_group_ramp(None, group_addr, transition_time, brightness)
+        else:
+            # lighting off
+            userdata.lighting_group_off(group_addr)
+            self.lighting_group_off(None, group_addr)
+
     def on_message(self, client, userdata: CBusHandler, msg: mqtt.MQTTMessage):
         """Handle a message from an MQTT subscription."""
         if not (msg.topic.startswith(_LIGHT_TOPIC_PREFIX) and
@@ -155,20 +175,7 @@ class MqttClient(mqtt.Client):
         if transition_time < 0:
             transition_time = 0
 
-        # push state to CBus and republish on MQTT
-        if light_on:
-            if brightness == 255 and transition_time == 0:
-                # lighting on
-                userdata.lighting_group_on(ga)
-                self.lighting_group_on(None, ga)
-            else:
-                # ramp
-                userdata.lighting_group_ramp(ga, transition_time, brightness)
-                self.lighting_group_ramp(None, ga, transition_time, brightness)
-        else:
-            # lighting off
-            userdata.lighting_group_off(ga)
-            self.lighting_group_off(None, ga)
+        Periodic.messageThrottler.enqueue(lambda: self.switchLight(userdata, ga, light_on, brightness, transition_time))
 
     def publish(self, topic: Text, payload: Dict[Text, Any]):
         """Publishes a payload as JSON."""
@@ -306,8 +313,18 @@ def read_cbz_labels(cbz_file: BinaryIO) -> Dict[int, Text]:
 
     return labels
 
+# Wait time between commands emitted by throtller
+_PERIOD = 0.97
+
 
 async def _main():
+    
+    # throttler is queue used used to stagger commmands
+    Periodic.throttler = Periodic(_PERIOD)
+    # messageThrottler is queue used used to stagger messages to signal multiple mqtt commands to switch
+    # There is no reason behind the value 0.1. It just seems to work ok. more specific testing would probably show 
+    # faster would work fine. 
+    Periodic.messageThrottler = Periodic(0.1)
     parser = ArgumentParser()
 
     group = parser.add_argument_group('Logging options')
